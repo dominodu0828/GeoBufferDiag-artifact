@@ -1,14 +1,16 @@
 # GeoBufferDiag artifact staging
 
-This repository is private staging for the GeoBufferDiag PVLDB EA&B submission materials.
+This repository is private staging for the GeoBufferDiag PVLDB submission.
 
-## Files
+## Current manuscript
 
-- `submission/GeoBufferDiag_final_20261126.pdf` — author-provided manuscript PDF, 9 pages.
-- `private-review/GeoBufferDiag-repro-20261125.zip` — reproducibility archive for private review only.
+- `submission/GeoBufferDiag_final_20261127.pdf` — updated nine-page manuscript.
+- `submission/GeoBufferDiag_source_20261127.zip` — LaTeX source, bibliography, template files, and figures for that PDF.
+
+The authors confirmed that the evaluated Baidu Maps-derived street-view records and So2Sat-derived records may be used and publicly released for this project.
 
 ## Release status
 
-This repository and the archive are private. The archive is not cleared for public redistribution. Street View and So2Sat derived-data provenance and redistribution permissions, code licensing, and removal of machine-specific paths and row-level records remain under review. Do not change this repository to public or cite it as the paper's reviewer-accessible artifact URL until those checks are resolved and a public archival release is prepared.
+The repository remains private. The legacy `private-review/GeoBufferDiag-repro-20261125.zip` is retained for private review only; it contains environment-specific paths and internal operational material and is not the public release package. The code license and a scrubbed, reviewer-ready reproduction archive still need to be prepared separately.
 
-The paper's `\\vldbavailabilityurl{}` remains intentionally empty until a real public artifact URL exists.
+The paper's `\\vldbavailabilityurl{}` remains empty until a real public archival URL exists.
