@@ -1,0 +1,363 @@
+\documentclass[sigconf, nonacm]{acmart}
+%%% do not modify the following VLDB block %%
+\usepackage{pvldb}
+\usepackage{microtype}
+%%% VLDB block end %%%
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\usepackage{amssymb}
+\renewcommand\vldbdoi{XX.XX/XXX.XX}
+\renewcommand\vldbpages{XXX-XXX}
+\renewcommand\vldbavailabilityurl{https://github.com/dominodu0828/GeoBufferDiag-artifact}
+\newcommand{\sys}{GeoBufferDiag}
+\newcommand{\full}{\textsc{Full}}
+\newcommand{\matched}{\texttt{matched}}
+\newcommand{\audit}{\texttt{audit}}
+\newcommand{\stats}{\texttt{stats}}
+\newcommand{\pref}{\operatorname{prefix}}
+\newcommand{\cmark}{\textbf{+}}
+\setlength{\emergencystretch}{3em}
+\begin{document}
+\title[GeoBufferDiag: Exact Spatial Filtering with Shared Class Quotas]{GeoBufferDiag: Exact Spatial Filtering with Shared Class Quotas [Experiment, Analysis \& Benchmark]}
+\author{Hangyu Du}
+\affiliation{\institution{The Hong Kong University of Science and Technology (Guangzhou)}\city{Guangzhou}\country{China}}
+\email{dominohydu@hkust-gz.edu.cn}
+\author{Si Qiao}
+\correspondingauthor
+\affiliation{\institution{The Hong Kong University of Science and Technology (Guangzhou)}\city{Guangzhou}\country{China}}
+\email{siqiao@hkust-gz.edu.cn}
+\renewcommand{\shortauthors}{Hangyu Du and Si Qiao}
+
+\begin{abstract}
+Constructing spatially buffered training splits for geospatial machine learning couples distance-based exclusion predicates with class quotas shared across validation folds. Although output-aware evaluation---combining grid-block bounds, quota intervals, and early-stopping ordered scans---can theoretically prune candidate distance computations, existing microbenchmarks that count geometric queries alone overlook quota maintenance and output serialization, leaving its end-to-end benefit unclear. We address this gap with \sys, an end-to-end diagnostic benchmark enforcing a strict output-equivalence contract, and systematically compare an output-aware incremental pipeline (\full) against shared vectorized KD-tree baselines (B1). Across 12 real-world workloads spanning 10 cities, \full\ reduces candidate-point distance queries by 9.41\% on the six-workload primary suite yet takes 1.28--2.09$\times$ the median end-to-end runtime of the faster KD-tree baseline in cold single-radius runs. Fine-grained profiling, external quota injection, and fixed-sample deletion sweeps reveal that quota-interval closure, rank traversal, block-center queries, and streaming gzip serialization (which consumes a median 42.2\% of elapsed time) consistently outweigh point-level query savings. Multi-layer validation across cloud environments, an independent brute-force float64 oracle, and a PostgreSQL/PostGIS SQL path confirms exact output equivalence while exposing five subtle contract-violation hazards that count-based evaluations miss.
+\end{abstract}
+\keywords{Spatial filtering, spatial cross-validation, shared class quotas, output-aware query evaluation, benchmarking, output equivalence}
+\maketitle
+%%% do not modify the following VLDB block %%
+\vldbtopmatter
+%%% VLDB block end %%%
+
+\section{Introduction}
+Geospatial prediction tasks---such as street-view urban sensing and remote-sensing local climate zone (LCZ) mapping---routinely construct spatially buffered training and test splits from a single georeferenced table to mitigate spatial autocorrelation leakage. A spatial buffer excludes training candidates near each test fold, after which a deterministic sampling rule selects the rows passed to downstream models. When buffered and unbuffered experimental arms must preserve identical class sizes across folds, the output of any single fold depends on the retained class counts of every other fold. Shared class quotas and a stable selection order therefore elevate spatial filtering from a standalone table predicate into a coupled systems operator combining spatial exclusion, cross-fold aggregation, and ordered output construction.
+
+Two practical challenges hinder the design and evaluation of this operator. First, on the algorithmic side, the end-to-end trade-off between two competing paradigms remains uncharacterized. A simple shared vectorized baseline amortizes a single batch distance computation across radii and repeats, whereas an output-aware incremental pipeline layers spatial block bounds, quota intervals, and early-stopping scans to avoid unnecessary distance evaluations---at the cost of extra indexing, state bookkeeping, and control flow. Second, on the evaluation side, benchmarking approaches that tally only geometric distance computations---or omit output serialization and the exact quota contract---can yield performance rankings that reverse under end-to-end measurement and mask silent correctness bugs.
+
+To resolve these challenges, we present \sys, a reproducible diagnostic benchmark for exact spatially buffered split construction under a strict output-equivalence contract covering occurrence identities, shared class quotas, ordered output sequences, and rejection states. On identical frozen inputs, \sys\ contrasts shared vectorized KD-tree baselines (B1 and bounded B1) against a full output-aware pipeline (\full) integrating grid-block pruning (C1), quota-interval closure (C2), and windowed ordered early stopping. Through controlled end-to-end profiling and multi-layer verification, our study answers three questions: (1) whether output-aware pruning outperforms shared vectorization end to end, (2) which execution stages govern runtime across workloads and deletion rates, and (3) what contract-violation hazards arise under strict output equivalence.
+
+This paper makes three concrete contributions:
+\begin{itemize}
+\item \textbf{Formalized Contract and Diagnostic Benchmark.} We formalize spatially buffered split construction with cross-fold shared quotas and deterministic prefix selection, and build \sys---an end-to-end benchmark backed by cross-platform cloud reproduction, an independent brute-force float64 oracle, and a PostgreSQL/PostGIS SQL verification path.
+\item \textbf{End-to-End Empirical Comparison and Counterintuitive Finding.} Across 12 real-world city workloads and controlled deletion sweeps, we show that although \full\ cuts candidate-point distance queries by 9.41\% on the primary suite, it runs 1.28--2.09$\times$ slower than the faster shared KD-tree baseline in cold single-radius execution, and this disadvantage persists under multi-radius batches, warm caches, and externally supplied quotas.
+\item \textbf{Bottleneck Attribution, Contract Hazards, and Design Guidelines.} Through stepwise ablations, streaming-writer profiling, and mutation testing, we attribute the slowdown to quota closure, rank traversal, block-center queries, and gzip serialization (median 42.2\% of total time), distill five recurring classes of contract-violation hazards missed by count-based benchmarks, and derive practical operator and I/O guidelines for geospatial data pipelines.
+\end{itemize}
+
+The remainder of this paper is organized as follows. Section~2 reviews related work and clarifies our boundaries. Section~3 formalizes the workload and output-equivalence contract. Section~4 details the \sys\ framework and evaluated pipelines. Section~5 presents the experimental setup, results, and engineering implications, and Section~6 concludes.
+
+\section{Related Work}
+\textbf{Spatial Filtering and Nearest-Neighbor Indexing.} Spatial join and range-filtering engines classically pair coarse spatial indexing with exact geometric refinement, as established in R-tree spatial joins~\cite{brinkhoff1993} and branch-and-bound nearest-neighbor search~\cite{roussopoulos1995}, and widely deployed in spatial database predicates such as PostGIS \texttt{ST\_DWithin}~\cite{postgis}; vectorized query execution and scalable spatial systems extend the same batched-filtering principle to modern CPU and distributed settings~\cite{boncz2005,eldawy2015}. Our block-filtering operator (C1) adopts the same filter--refine principle, while our baseline (B1) exploits the fact that a single exact nearest-test distance array decides membership across every buffer radius. Unlike single-predicate spatial anti-joins, however, buffered split construction couples geometric filtering with cross-fold quota minima and deterministic output ordering.
+
+\textbf{Top-$k$ Aggregation and Early-Stopping Evaluation.} Classical threshold and top-$k$ aggregation algorithms characterize when ordered access permits early termination before scanning all inputs~\cite{fagin2003,ilyas2008}. In our workload, candidate ordering is fixed by a deterministic sampling key, spatial distance governs eligibility, and---crucially---the required prefix length $q_{j,y}$ is not given in advance but emerges as a minimum across coupled validation folds. Consequently, early-stopping selection cannot proceed until cross-fold quota bounds converge, introducing coordination overhead absent from standard top-$k$ queries.
+
+\textbf{Inter-Query State Reuse and Spatial Validation Pipelines.} Work on shared arrangements demonstrates how reusing indexed state amortizes work across concurrent queries~\cite{mcsherry2020}. Adopting this principle for fair benchmarking, \sys\ exposes consistent state-reuse opportunities across all evaluated paradigms on fixed table snapshots. Geospatial machine learning studies discuss spatial validation and its effects on predictive assessment~\cite{roberts2017,ploton2020}; our benchmark instead measures the computational cost and output equivalence of a specific buffered split-construction contract.
+
+\begin{table}[t]
+\caption{Positioning of \sys\ against related research areas. ``+'' denotes support, $\times$ absence.}
+\label{tab:positioning}\centering\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lcccc}\toprule
+Research Area & Spatial & Cross-Fold & Deterministic & End-to-End\\
+& Exclusion & Shared Quota & Prefix Order & I/O \& Contract\\\midrule
+Spatial Joins / PostGIS~\cite{brinkhoff1993,roussopoulos1995,postgis} & \cmark & $\times$ & $\times$ & $\times$\\
+Top-$k$ Early Stopping~\cite{fagin2003} & $\times$ & $\times$ & \cmark & $\times$\\
+\sys\ (Ours) & \cmark & \cmark & \cmark & \cmark\\\bottomrule
+\end{tabular}
+\end{table}
+
+As summarized in Table~\ref{tab:positioning}, \sys\ sits at the intersection of these lines of research, evaluating how spatial filtering, shared quota aggregation, ordered selection, and output serialization interact end to end under an exact contract.
+
+\section{Problem Formulation}
+\begin{table*}[t]
+\caption{Summary of notation.}
+\label{tab:notation}\centering\small
+\begin{tabular}{ll}\toprule
+Symbol & Definition\\\midrule
+$x_i\in\mathbb{R}^2,\; y_i\in\{0,1\},\; k_i$ & Projected coordinates, binary class label, and fixed sampling key of occurrence $i\in\{0,\dots,n-1\}$\\
+$\mathcal{F}_j,\; T_f,\; R_f$ & Usable fold set in repeat $j$; test set of fold $f$; candidate set $R_f=\{0,\dots,n-1\}\setminus T_f$\\
+$d_f(i),\; K_f(r)$ & Exact nearest-test Euclidean distance of $i$ in fold $f$; buffered candidate pool at radius $r$\\
+$Y_y,\; q_{j,y}(r)$ & Set of occurrences in class $y$; shared class-$y$ quota across all folds $f\in\mathcal{F}_j$\\
+$U_{j,f,y}(r),\; B_{j,f,y}(r)$ & Deterministically ordered unbuffered and buffered selected sequences\\
+$c_b,\; \rho_b,\; D_{f,b}$ & Centroid, covering radius, and exact nearest-test distance of grid block $b$\\
+$[L_{f,y},\; U_{f,y}]$ & Certified lower and upper bounds on fold $f$'s retained count for class $y$\\\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Input Model, Buffer Predicate, and Shared Quotas}
+Let a city table consist of $n$ georeferenced occurrences indexed by $i\in\{0,\dots,n-1\}$, where each occurrence carries projected planar coordinates $x_i\in\mathbb{R}^2$ (in float64), a binary class label $y_i\in\{0,1\}$, and a fixed sampling key $k_i$ (Table~\ref{tab:notation}). Each occurrence has a unique identity defined by its source-manifest hash and original row position; duplicate business identifiers or coincident coordinates remain distinct rows. A frozen partition builder supplies repeats $j$ and their usable fold sets $\mathcal{F}_j$, combining scattered folds with fixed contiguous folds. For each fold $f\in\mathcal{F}_j$ with test set $T_f$ and candidate set $R_f=\{0,\dots,n-1\}\setminus T_f$, the nearest-test Euclidean distance and retained candidate pool at radius $r\ge 0$ are defined as:
+\begin{equation}
+d_f(i)=\min_{t\in T_f}\|x_i-x_t\|_2,
+\qquad
+K_f(r)=
+\begin{cases}
+R_f, & r=0,\\
+\{i\in R_f: d_f(i)>r\}, & r>0.
+\end{cases}
+\label{eq:buffer}
+\end{equation}
+Under this contract, the zero-radius arm ($r=0$) represents unbuffered selection and retains coincident points, whereas any positive radius enforces a closed-ball exclusion ($d_f(i)\le r$ is deleted).
+
+For class $y\in\{0,1\}$ with class set $Y_y=\{i: y_i=y\}$, the shared quota of repeat $j$ is the minimum retained class count across all usable folds:
+\begin{equation}
+q_{j,y}(r)=\min_{f\in\mathcal{F}_j}|K_f(r)\cap Y_y|.
+\label{eq:quota}
+\end{equation}
+Because $K_f(r)\subseteq R_f$, including the unbuffered pool in the minimum leaves $q_{j,y}(r)$ unchanged. Feasibility requires $\min_{y\in\{0,1\}} q_{j,y}(r)\ge 5$ for every repeat $j$; if any repeat violates this threshold, the entire (city, radius) request is rejected with an explicit status record.
+
+\subsection{Deterministic Prefix Selection and Output-Equivalence Contract}
+Within each class, candidates follow a strict total order defined lexicographically by $(k_i,i)$, where ties in sampling key $k_i$ break by original city row index $i$. Denoting by $\pref_q(A)$ the first $q$ occurrences of set $A$ under this order, the unbuffered and buffered training sequences for repeat $j$, fold $f$, and class $y$ are:
+\begin{equation}
+U_{j,f,y}(r)=\pref_{q_{j,y}(r)}(R_f\cap Y_y),
+\,
+B_{j,f,y}(r)=\pref_{q_{j,y}(r)}(K_f(r)\cap Y_y).
+\label{eq:prefix}
+\end{equation}
+In serialized outputs, positive-class rows precede negative-class rows. Output equivalence therefore requires exact agreement on occurrence identities, multiplicities, and sequence positions.
+
+\sys\ supports three contract modes: (i) \matched, which emits the ordered arms $U_{j,f,y}(r)$ and $B_{j,f,y}(r)$; (ii) \audit, which additionally materializes complete candidate, retained, and deleted occurrence lists; and (iii) \stats, which reports pool cardinalities and shared quotas. Every request emits status metadata preserving full float64 radius precision so that nearby distinct radii never collide after serialization, while repeated identical radii share a single numerical evaluation. This formulation isolates exact split construction as a self-contained, verifiable data-preparation operator.
+
+\section{\sys: Framework and Evaluated Pipelines}
+\begin{figure*}[t]
+\centering\includegraphics[width=\textwidth]{figures/arch_export.png}
+\caption{Execution pipeline comparison in \textsc{GeoBufferDiag}. (a) The shared vectorized baseline (B1) builds one KD-tree per distinct test mask and reuses exact nearest-neighbor distances across radii and repeats. (b) The output-aware pipeline (FULL) layers grid-block bounds (C1), shared-quota interval closure for unresolved rows (C2), and windowed ordered scanning, with a decided-row bypass and a vectorized fallback. The dashed Contract Verifier layer independently checks exact output equivalence (Section~4.5).}
+\Description{Two horizontal lanes compare B1 and FULL. B1 builds a test-set KD-tree, batches nearest-neighbor queries, thresholds across radii and slices ordered prefixes. FULL uses block filtering, quota interval closure for unresolved rows, windowed ordered scanning and output serialization; decided rows bypass exact point queries, and scanning may fall back to vectorized completion. A dashed contract-verifier box on the right checks both pipelines.}
+\label{fig:arch}
+\end{figure*}
+
+Figure~\ref{fig:arch} contrasts the two execution pipelines evaluated in \sys\ alongside its contract-verification layer. Below, we detail the shared vectorized baselines, each incremental component of the output-aware pipeline---highlighting the specific bottleneck it targets---and the multi-layer verifier enforcing strict output equivalence.
+
+\subsection{Shared Vectorized Baselines (B1 and Bounded B1)}
+To amortize spatial queries across multiple buffer radii and repeated folds, the B1 baseline builds one KD-tree per distinct test mask and evaluates exact nearest-test distances for all candidates in a single vectorized batch using SciPy's \texttt{cKDTree}~\cite{scipyquery}. Once computed, the distance array is thresholded at any requested radius $r$, and contiguous masks recurring across repeats directly reuse their cached arrays. Class orders are precomputed once per snapshot; selection applies a boolean pool mask to these orders and slices the first $q_{j,y}(r)$ entries, caching repeated (mask, radius, quota) queries within each static table snapshot.
+
+The bounded B1 variant restricts each KD-tree search to the largest requested radius widened by a $10^{-8}$~m safety margin, representing out-of-range distances as $+\infty$ and recomputing near-boundary candidates. Crucially, each infinite entry certifies exclusion only up to the stored search radius: if a subsequent call requests a larger radius, bounded B1 requeries all previously truncated candidates and updates its validity bound---preventing the truncated-cache contract hazard analyzed in Section~\ref{sec:bottleneck}.
+
+\subsection{Grid-Block Filtering (C1)}
+To avoid issuing point-level distance queries for candidates located far from or tightly adjacent to the test set, C1 partitions city points into uniform spatial grid blocks. For each block $b$ with centroid $c_b$ and covering radius $\rho_b$, a single KD-tree query yields $D_{f,b}=d_f(c_b)$. Because the distance-to-set function is 1-Lipschitz, every candidate $i$ in block $b$ satisfies:
+\begin{equation}
+\max(0, D_{f,b}-\rho_b)\le d_f(i)\le D_{f,b}+\rho_b.
+\label{eq:block}
+\end{equation}
+For $r>0$, a lower bound strictly above $r$ certifies retention, whereas an upper bound at most $r$ certifies deletion; certified rows bypass exact point queries altogether, leaving only undecided blocks for point-level evaluation.
+
+To prevent floating-point rounding from flipping decisions near the buffer boundary, C1 enforces a conservative tolerance $\tau=\max\bigl(10^{-6},\,16\,\varepsilon_{\mathrm{mach}}\max(|D_{f,b}|,\rho_b,r)\bigr)$~m. Any block whose interval $[D_{f,b}-\rho_b,\,D_{f,b}+\rho_b]$ intersects $[r-\tau,\,r+\tau]$ or contains non-finite values is conservatively marked undecided for exact verification---a safeguard validated on synthetic boundary cases at 5~m and 200~m and coordinate magnitudes up to $10^{15}$~m. In standalone C1 ablation runs, all undecided rows are resolved before vectorized prefix selection.
+
+\subsection{Shared-Quota Interval Closure (C2)}
+Computing exact quotas naively requires resolving every undecided candidate in every fold before taking the minimum in Equation~\ref{eq:quota}. To short-circuit this aggregation, C2 maintains certified count bounds $[L_{f,y},U_{f,y}]$ per fold and class, where $L_{f,y}$ counts geometrically proven retained rows and $U_{f,y}$ adds unresolved candidates. The shared quota is thus bracketed by:
+\begin{equation}
+\min_{f\in\mathcal{F}_j} L_{f,y}\le q_{j,y}(r)\le\min_{f\in\mathcal{F}_j} U_{f,y}.
+\label{eq:interval}
+\end{equation}
+Equality of the two endpoints locks in the exact quota, while an upper bound below five immediately certifies infeasibility. By default, a priority scheduler refines the pending fold with the smallest sum of class upper bounds (breaking ties by lower bounds and fold index); a fixed-order variant scans pending folds sequentially.
+
+During refinement, C2 scans a fold's class order until it proves the current quota upper bound attainable or exhausts all candidates, caching exact distances for subsequent radii and selection. Crucially, any fold whose lower bounds already meet or exceed both current quota upper bounds is excluded from the pending set; without this exclusion, refinement can repeatedly revisit a proven fold without tightening either bound. In standalone C1+C2 ablations, ordinary vectorized prefix selection runs once quotas close.
+
+\subsection{Windowed Ordered Selection (FULL)}
+When the shared quota $q_{j,y}(r)$ is small relative to the candidate pool, resolving the tail of the class order is unnecessary for \matched\ outputs. Once exact quotas close, \full\ first checks whether the unbuffered prefix $U_{j,f,y}(r)$ survives intact; if so, it directly reuses that prefix. Otherwise, \full\ scans the fold's class order in windows of 4{,}096 positions (selected on a disjoint development set, Section~5.1), querying uncertain candidates in batches, skipping deleted rows, and stopping immediately upon collecting $q_{j,y}(r)$ retained rows. When estimated remaining scan work is unfavorable, a fallback rule completes the fold via a single vectorized query.
+
+\begin{proposition}
+Fix a quota $q$ and a strict total order on $R$. If the first $q$ occurrences of $R$ all belong to $K\subseteq R$, then $\mathrm{prefix}_q(K)=\mathrm{prefix}_q(R)$.
+\end{proposition}
+\begin{proof}
+All $q$ occurrences in $\mathrm{prefix}_q(R)$ belong to $K$, and every remaining element of $K$ succeeds them in the total order on $R$. Hence the first $q$ elements of $K$ coincide identically with $\mathrm{prefix}_q(R)$.
+\end{proof}
+
+The same order monotonicity justifies halting windowed scans at the $q$-th retained occurrence in \matched\ mode. In \audit\ and \stats\ modes, remaining undecided rows are resolved to materialize full pool memberships, while geometrically certified rows still require zero additional point queries.
+
+\subsection{Multi-Layer Contract Verification}
+\label{sec:verification}
+To eliminate mutual-agreement blind spots between B1 and \full, \sys\ enforces contract compliance through three independent verification layers: (1) an exhaustive float64 oracle that computes chunked brute-force Euclidean distances without KD-trees or spatial pruning; (2) a relational spatial SQL path executing the frozen split specification in PostgreSQL~17 with PostGIS directly over reconstructed point--fold tables; and (3) artifact round-trip and fault-injection checks verifying SHA-256 payload digests, status budgets, and immediate detection of five injected corruptions (missing status row, missing payload file, duplicated key, altered radius, and altered sample identity).
+
+\section{Experiments}
+Our evaluation investigates four research questions:
+\begin{itemize}
+\item \textbf{RQ1 (End-to-End Runtime):} Does output-aware incremental evaluation (\full) outperform shared vectorized KD-tree baselines across real-world city workloads?
+\item \textbf{RQ2 (Ablation \& Work Volume):} How do C1, C2, and windowed ordered selection individually affect query volume and runtime?
+\item \textbf{RQ3 (Bottlenecks \& Sensitivity):} How do quota closure, output serialization, fold geometry, and deletion rate govern end-to-end performance?
+\item \textbf{RQ4 (Correctness \& Hazards):} Does multi-layer validation confirm exact output equivalence, and what contract hazards arise in practice?
+\end{itemize}
+
+\subsection{Datasets, Baselines, and Experimental Setup}
+\textbf{Workloads, Data Provenance, and Partition Protocol.} Table~\ref{tab:data} summarizes 12 real-world workloads spanning 10 cities: street-view records sourced from Baidu Maps (SV) and two slices derived from the public So2Sat LCZ42 benchmark~\cite{zhu2020} (S10, S43). The suite contains six primary workloads and six additional coverage snapshots (938--10{,}620 rows). For the street-view workloads, we use city-specific projected coordinates and the associated binary labels. For So2Sat, we use projected patch-center coordinates and map zero-based LCZ classes 0--2 to positive and 3--5 to negative. The authors have verified that the use and public release of the evaluated records and derived inputs from both sources are permitted. The reproduction package contains the frozen coordinate--label inputs and reference outputs needed to rerun the reported workloads; it does not redistribute the underlying street-view imagery or satellite image patches. Workloads sharing a city across different sources (Shenzhen and Guangzhou) are timed independently and aggregated by normalized city name for city-level summaries.
+
+\begin{table}[t]
+\caption{Twelve workloads spanning ten cities. SV, S10, and S43 denote streetview, so2sat10, and so2sat43. Repeats refer to scattered five-fold partitions. The fixed contiguous partition is reused in every repeat.}
+\label{tab:data}\centering
+\begin{tabular}{llrrr}\toprule
+Manifest & City & Rows & Repeats & Radius (m)\\\midrule
+SV & Shenyang & 1,602 & 20 & 100\\
+SV & Shenzhen & 10,620 & 20 & 100\\
+S10 & Guangzhou & 1,214 & 20 & 200\\
+S10 & Moscow & 1,749 & 20 & 200\\
+S43 & Shenzhen & 1,778 & 5 & 200\\
+S43 & Hong Kong & 2,055 & 5 & 200\\\midrule
+\multicolumn{5}{l}{\emph{Coverage snapshots (Section~\ref{sec:coverage})}}\\
+SV & Dalian & 2,844 & 20 & 100\\
+SV & Guangzhou & 4,143 & 20 & 100\\
+S10 & Nairobi & 1,649 & 20 & 200\\
+S10 & Munich & 1,487 & 20 & 200\\
+S43 & Vancouver & 7,908 & 5 & 200\\
+S43 & Amsterdam & 938 & 5 & 200\\\bottomrule
+\end{tabular}
+\end{table}
+
+All methods consume identical frozen coordinates, labels, sampling keys, and five-fold ($K=5$) contiguous and scattered partitions generated with seed 20260801 (excluding single-class test folds). Grid block size (1{,}000~m) and scan window size (4{,}096 rows) were tuned once for minimum summed candidate runtime on a disjoint four-city development set (Wuhan, Mumbai, Islamabad, and Cairo). Evaluated request workloads cover each city's primary radius, a four-radius batch (0, 100, 200, and 400~m), a duplicate-radius batch repeating 200~m, and selected warm, \audit, and \stats\ configurations.
+
+\begin{table*}[t]
+\caption{Hardware and software execution environments. All environments are restricted to single-threaded execution.}
+\label{tab:env}\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{2.3cm}p{6.2cm}p{5.0cm}p{3.0cm}}\toprule
+Environment & Hardware \& OS & Software Stack & Role\\\midrule
+Local Workstation & Intel Core i7-10750H, 15.8 GiB RAM, Windows 10 (build 19045) & Python 3.12.10, NumPy 2.5.2, SciPy 1.18.1 (\texttt{cKDTree}) & Primary \& coverage runtime tables\\
+Cloud Linux (Repro) & AMD EPYC 9V74 (pinned 1 core), Debian 13 & Python 3.12.14, single-threaded BLAS & Full-matrix cross-platform reproduction\\
+Containerized Linux & 4 vCPUs, 16 GiB RAM, single numeric thread & Pre-installed stack + PostgreSQL 17 / PostGIS & Exhaustive oracle, SQL \& diagnostic checks\\\bottomrule
+\end{tabular}
+\end{table*}
+
+\textbf{Environments and Timing Protocol.} Table~\ref{tab:env} details the three execution environments, all restricted to single-threaded execution. Because hardware and dependency stacks differ across platforms, raw timings are never pooled across environments; paired ratios are computed strictly within each platform. In both real-data matrices (180 configurations each; 900 formal runs), every configuration executes one discarded warm-up followed by five timed repetitions in an interleaved round-robin order. Cold runs reload exported inputs and rebuild all derived indices within the benchmark process on each call, whereas warm runs reuse eligible distance and selection caches.
+
+Total runtime covers input loading, engine execution, status output, and payload serialization (encoding row identities to gzip-compressed CSV). Subtracting payload write time from total runtime per repetition yields residual engine time. We report medians and min--max ranges across repetitions to capture central tendency and dispersion without pooling raw timings across distinct workloads.
+
+\subsection{End-to-End Runtime Comparison (RQ1)}
+\label{sec:coverage}
+In cold single-radius \matched\ runs across the six primary workloads, \full\ takes 1.42--1.93$\times$ the median runtime of the faster KD-tree baseline (Table~\ref{tab:runtime}, Figure~\ref{fig:runtime}a). Bounded B1 outperforms unbounded B1 on the two street-view workloads but trails it on the four So2Sat workloads; comparing against the faster variant per workload prevents crediting \full\ against a suboptimal baseline. The same performance ordering holds under richer request mixes (Table~\ref{tab:batch}): relative to unbounded B1, \full\ exhibits median ratios of 1.37--1.75$\times$ on the four-radius batch, 1.43--1.94$\times$ on the repeated 200~m batch, 1.09--1.28$\times$ on the \audit\ batch, and 1.25--2.21$\times$ in warm single-radius runs.
+
+\begin{table*}[t]
+\caption{Single primary radius, cold \matched\ execution. All times are medians in milliseconds over five repetitions. The last column divides \full\ by the faster KD variant.}
+\label{tab:runtime}\centering
+\begin{tabular}{llrrrrrrr}\toprule
+Manifest & City & B1 & Bounded B1 & C1 & C1+C2 & \full & Best KD & Ratio\\\midrule
+SV & Shenyang & 459.2 & 428.1 & 504.3 & 601.7 & 636.9 & 428.1 & 1.49\\
+SV & Shenzhen & 3361.8 & 3215.6 & 3581.3 & 4282.2 & 4570.0 & 3215.6 & 1.42\\
+S10 & Guangzhou & 234.4 & 453.1 & 308.4 & 387.9 & 451.8 & 234.4 & 1.93\\
+S10 & Moscow & 366.3 & 647.3 & 462.4 & 579.0 & 613.1 & 366.3 & 1.67\\
+S43 & Shenzhen & 94.0 & 200.7 & 113.1 & 150.5 & 157.2 & 94.0 & 1.67\\
+S43 & Hong Kong & 106.3 & 236.3 & 124.1 & 163.0 & 167.9 & 106.3 & 1.58\\\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{table}[t]
+\caption{Median \full/B1 runtime ratios by workload. Batch uses radii 0/100/200/400 m. Duplicate adds another 200 m request. Warm uses one primary radius and \matched\ output.}
+\label{tab:batch}\centering
+\begin{tabular}{lrrrr}\toprule
+Workload & Batch & Duplicate & Audit batch & Warm\\\midrule
+Shenyang (SV) & 1.65 & 1.57 & 1.21 & 1.25\\
+Shenzhen (SV) & 1.37 & 1.43 & 1.09 & 1.27\\
+Guangzhou (S10) & 1.75 & 1.91 & 1.26 & 2.17\\
+Moscow (S10) & 1.72 & 1.94 & 1.28 & 1.59\\
+Shenzhen (S43) & 1.57 & 1.69 & 1.25 & 1.54\\
+Hong Kong (S43) & 1.57 & 1.67 & 1.19 & 2.21\\\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figures/fig_runtime_ablation.pdf}
+  \caption{Single-radius cold matched runtime and cumulative ablation ratios. (a) Five-repeat medians across six primary workloads (SHY: Shenyang; SHZ: Shenzhen; GZ: Guangzhou; MOS: Moscow; HK: Hong Kong; SV/S10/S43 identify the source workload), annotated with \texttt{FULL} slowdown relative to the faster KD-tree variant. (b) Progressive overhead when adding block bounds (C1), quota intervals (C1+C2), and ordered selection (FULL), normalized by unbounded B1.}
+  \Description{Grouped logarithmic bars show B1, bounded B1, and FULL runtimes in six primary workloads with FULL slowdown labels. A line chart shows cumulative C1, C1+C2, and FULL runtime ratios against B1.}
+  \label{fig:runtime}
+\end{figure*}
+
+\textbf{Generalization Across Density Extremes.} To test whether these findings hold across diverse spatial densities, we evaluated six additional city snapshots (938--7{,}908 rows; five new cities plus a distinct Guangzhou slice) selected deterministically by taking the densest and sparsest cities per source ranked by bounding-box point density (breaking ties by median nearest-neighbor distance and city name). Across all six snapshots in cold single-radius \matched\ runs, \full\ again trails the faster KD-tree baseline, with median runtime ratios ranging from 1.28$\times$ to 2.09$\times$---establishing a combined 1.28--2.09$\times$ slowdown across all 12 workloads.
+
+\textbf{Cross-Platform Reproduction.} Re-executing both the primary and coverage matrices (1{,}800 formal runs total) from frozen inputs on the Debian 13 cloud environment reproduced every reference output with zero discrepancies (Table~\ref{tab:validation}), confirming that both the output-equivalence contract and workload behavior transfer across operating systems and CPU architectures.
+
+\subsection{Ablation Study and Query-Volume Decomposition (RQ2)}
+\textbf{Why Fewer Candidate Queries Do Not Yield Speedups.} Across the six primary cold \matched\ batches, B1 issues 1{,}364{,}624 candidate-point distance queries. \full\ reduces candidate queries to 1{,}236{,}189 (1{,}205{,}479 during quota closure and 30{,}710 during selection), saving 128{,}435 queries ($-9.41\%$). However, \full\ also issues 205{,}918 block-center queries, bringing total distance-query positions to 1{,}442{,}107---5.68\% higher than B1 (Figure~\ref{fig:work}a). Beyond the net increase in total queries, replacing one contiguous batch KD-tree call with fragmented block-center and incremental point queries degrades cache locality and vectorization efficiency.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figures/fig_work_bottleneck.pdf}
+  \caption{Work-volume and streaming-writer phase summaries. (a) In the six-workload cold matched batch, FULL reduces candidate-point queries by $9.41\%$ ($1.36$M to $1.24$M) but adds $0.21$M block-center queries, yielding $5.68\%$ more total query positions. (b) Streaming-writer phase profiling: quota closure consumes $33.8$--$45.4\%$ of FULL total runtime in the reported single-radius cells; across twelve cells, serialization and compression account for a median $42.2\%$ of elapsed time (maximum $80.2\%$).}
+  \Description{A horizontal stacked bar comparison separates candidate-point and block-center query positions for B1 and FULL. A second panel shows quota-phase shares for three FULL workloads and the twelve-cell median and maximum streaming-writer share.}
+  \label{fig:work}
+\end{figure*}
+
+\textbf{Stepwise Pipeline Overhead.} Figure~\ref{fig:runtime}b and Table~\ref{tab:runtime} trace the cumulative cost along the B1 $\to$ C1 $\to$ C1+C2 $\to$ \full\ ladder. Adding grid-block bounds (C1) already raises median runtime to 1.19$\times$ of B1 despite lowering candidate queries in every city---for example, in Shenyang (SV), exact candidate queries drop from 134{,}568 to 82{,}642 while median runtime rises from 459.2~ms to 504.3~ms. Across the mixed-radius batch (823{,}672 non-empty candidate block evaluations, including zero-radius blocks certified automatically), 418{,}637 blocks are certified retained, 48{,}852 deleted (56.8\% combined), and 356{,}183 remain uncertain. Layering quota intervals (C1+C2) further increases runtime on all six workloads due to interval bookkeeping, and adding ordered selection (\full) raises every median again: across the batch, \full\ inspects 5{,}533{,}565 rank positions across 1{,}826 scan windows and triggers 101 vectorized fallbacks (with its prefix fast path succeeding 1{,}565 times and failing 1{,}425 times, and zero test-row self-queries).
+
+\subsection{Bottleneck Attribution, Sensitivity Analysis, and Contract Hazards (RQ3 \& RQ4)}
+\label{sec:bottleneck}
+\textbf{Phase Profiling and Serialization Dominance.} Instrumented profiling on three workloads (Shenzhen SV, Shenzhen S43, and Guangzhou S10) confirms low measurement overhead (median 1.037$\times$ runtime ratio, range 0.953--1.115$\times$; median unattributed residual 7.6~ms, or 1.9\% of total time). Re-timing 12 cold \matched\ cells (three workloads $\times$ two methods $\times$ single/batch modes; 7 repetitions each) with the streaming gzip CSV writer reveals two dominant bottlenecks (Figure~\ref{fig:work}b). First, output serialization and compression account for a median 42.2\% of total elapsed time (peaking at 80.2\% for B1's four-radius batch on Shenzhen SV). Second, within \full's compute engine, quota closure is the single largest phase in all six cells, taking 998.6~ms out of 2{,}956.2~ms total on Shenzhen SV (versus 588.3~ms for B1's exact-distance phase), 39.9\% on Shenzhen S43, and 45.4\% on Guangzhou S10. Here 2{,}956.2~ms is the instrumented-arm median from a separate seven-repetition profiling run, whereas the 4{,}570.0~ms entry in Table~\ref{tab:runtime} is a five-repetition median collected on a different date: the two runs share identical engine and writer code (unchanged source hashes) and frozen inputs but not timing conditions, and the primary run was captured on the shared workstation under heavier external load (only 0.8~GiB of free RAM at environment capture), so their absolute totals should not be compared directly. The relative ordering is nonetheless preserved within this profiling run: the uninstrumented single-radius \full/B1 ratios are 1.34$\times$, 1.44$\times$, and 1.89$\times$ and the batch ratios are 1.37$\times$, 1.64$\times$, and 1.74$\times$, all above one and hence consistent with the primary table.
+
+\textbf{Isolating Serialization and Quota Computation.} Removing I/O does not reverse the ranking: comparing residual engine time (total minus payload write time) across the six primary workloads still leaves B1 faster than \full\ by a median difference of 211.5~ms in \matched\ mode and 182.2~ms in \audit\ mode (where payload writing consumes medians of 34.2\%/21.6\% in \matched\ and 70.2\%/55.2\% in \audit\ for B1/\full). Similarly, bypassing quota derivation altogether by supplying frozen reference quotas externally reduces \full's median runtime by only 0.5--18.1\%, leaving \full\ slower than B1 on every workload (Table~\ref{tab:quota}); switching between priority and fixed fold scheduling yields ratios of 0.94--1.15$\times$. A complementary four-arm cloud diagnostic crossing both methods, natural versus fixed quotas, and gzip CSV versus a lightweight digest sink (1{,}008 formal runs across six synthetic samples and three radii) confirms the same compound bottleneck: even without natural quota closure or production gzip I/O, \full's median total runtime remains 1.14--1.35$\times$ that of B1.
+
+\begin{table}[t]
+\caption{External-quota and scheduling experiments. Times are single-radius cold \matched\ medians in milliseconds. Normal \full\ is shown in Table~\ref{tab:runtime}.}
+\label{tab:quota}\centering
+\begin{tabular}{lrrr}\toprule
+Workload & B1 ($q$) & \full{} ($q$) & Fixed/prio.\\\midrule
+Shenyang (SV) & 399.2 & 585.2 & 1.06\\
+Shenzhen (SV) & 3506.6 & 4024.6 & 1.07\\
+Guangzhou (S10) & 226.0 & 369.8 & 1.00\\
+Moscow (S10) & 346.9 & 541.4 & 1.00\\
+Shenzhen (S43) & 92.4 & 132.6 & 0.94\\
+Hong Kong (S43) & 100.0 & 167.0 & 1.15\\\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Cross-Fold Coupling Across Geometries.} Candidate-weighted deletion rates at the primary radius diverge sharply by fold geometry: scattered folds delete 22.5\% (Shenyang SV), 26.8\% (Shenzhen SV), 71.4\% (Guangzhou S10), 32.0\% (Moscow S10), 76.5\% (Shenzhen S43), and 79.8\% (Hong Kong S43), whereas contiguous folds delete nearly zero candidates. Because Equation~\ref{eq:quota} takes the minimum across all folds, high-deletion scattered folds impose tight quotas on low-deletion contiguous folds, forcing contiguous folds to scan their orders against restrictive constraints. Per-fold spatial selectivity alone therefore cannot predict required selection work.
+
+\textbf{Sensitivity to Deletion Rate.} To isolate buffer selectivity while holding data scale and geometry fixed, we evaluate 10 synthetic 10{,}000-row datasets (five seeds $\times$ two geometries) at three radius levels corresponding to the p10, p50, and p90 nearest-test distance quantiles (realized deletion rates of 10.0\%, 50.0\%, and 90.2\%; 420 formal runs, Table~\ref{tab:sweep}). \full\ trails B1 in all 30 sample-level cells, and its relative disadvantage worsens monotonically with deletion rate: the median \full/B1 ratio climbs from 1.18$\times$ at 10\% deletion to 1.32$\times$ at 50\% and 1.51$\times$ at 90\% (strictly increasing in 7 of 10 individual samples). Figure~\ref{fig:sweep} reveals the mechanism: while \full\ reduces exact queries by a nearly constant 13.1--13.3\% (208{,}002--208{,}476 versus B1's 240{,}000; rank-scan medians 436k, 487k, and 406k), shrinking outputs cut payload writing by more than 10$\times$ (480.9 to 45.3~ms for \full; 485.0 to 47.2~ms for B1). Meanwhile, \full's median engine time remains nearly flat (359.5, 365.9, and 339.0~ms), exposing the fixed control and traversal overhead of output-aware evaluation.
+
+\begin{table}[t]
+\caption{Fixed-sample radius response. Each of the ten samples is generated once and reused across all three radius levels, so the levels differ only in the buffer radius. Deletion rate is the mean over the five scattered folds of repeat 0. Times are medians over the ten samples; Ratio is the median of the ten per-sample \full/B1 ratios, with the min--max range in parentheses.}
+\label{tab:sweep}\centering\small
+\begin{tabular}{lrrrrr}\toprule
+Level & Deletion & Radius (m) & B1 & \full & Ratio\\\midrule
+p10 & 0.100 & 18--42 & 723.4 & 882.7 & 1.18 (1.06--1.48)\\
+p50 & 0.500 & 51--107 & 486.0 & 632.6 & 1.32 (1.18--1.38)\\
+p90 & 0.902 & 193--214 & 281.1 & 407.5 & 1.51 (1.17--1.65)\\\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/fig_radius_sweep.pdf}
+  \caption{Fixed-sample deletion sweep. As deletion rises from $10\%$ to $90\%$, payload writing drops by more than $10\times$ ($480.9$ to $45.3$~ms) while \texttt{FULL} engine time stays nearly constant ($339$--$366$~ms), and the median \texttt{FULL}/B1 ratio rises from $1.18\times$ to $1.51\times$. Bars show separately aggregated medians; components are not stacked because medians of components need not sum to the median total.}
+  \Description{Grouped bars compare B1 and FULL total time with separate FULL engine and payload-write medians. A second axis shows the FULL-to-B1 ratio increasing from 1.18 at 10 percent deletion to 1.51 at 90 percent deletion.}
+  \label{fig:sweep}
+\end{figure}
+
+\textbf{Multi-Layer Correctness Validation.} Table~\ref{tab:validation} summarizes our end-to-end contract verification across all four validation layers. Every checked artifact---including cross-platform cloud reproductions, independent brute-force float64 oracle runs, 3{,}200 ordered sequences produced by PostgreSQL~17 / PostGIS on Shenzhen (0--400~m; evaluated in a warm server state as a SQL semantic reference), and disk round-trip audits---achieved zero discrepancies, while all five injected file and metadata corruptions were immediately caught.
+
+\begin{table*}[t]
+\caption{Multi-layer validation summary (Section~\ref{sec:verification}).}
+\label{tab:validation}\centering\small
+\begin{tabular}{lll}\toprule
+Validation Layer & Scope \& Verified Artifacts & Discrepancies / Detection\\\midrule
+Cloud Reproduction (Debian 13) & 1{,}800 formal runs (primary + coverage); 110{,}037 reference checks & 0 discrepancies\\
+Exhaustive float64 Oracle & 10 synthetic datasets $\times$ 3 radii (480 runs); 240 cloud artifact pairs & 0 discrepancies\\
+PostgreSQL 17 / PostGIS SQL & Shenzhen workload at 0, 100, 200, 400 m (3{,}200 ordered sequences) & 0 discrepancies\\
+Writer, Round-Trip \& Fault Tests & 168 streaming + 630 writer checks; 1{,}056 file round-trips; 5 injected faults & 0 discrepancies; 5/5 faults caught\\\bottomrule
+\end{tabular}
+\end{table*}
+
+\textbf{Recurring Contract-Violation Hazards.} Developing and auditing these implementations surfaced five subtle correctness hazards that distance-count benchmarks entirely miss:
+\begin{itemize}
+\item \textbf{Truncated-Cache Domain Violation:} Reusing a bounded nearest-neighbor cache at a larger radius without invalidating previously truncated entries silently corrupts quotas and feasibility flags.
+\item \textbf{Closed-Boundary Equality Drift:} Failing to verify returned distances against the closed exclusion predicate ($d_f(i)\le r$) misclassifies points lying directly on the buffer boundary.
+\item \textbf{Proven-Fold Livelock:} Omitting proven folds from the pending refinement set causes quota-interval closure loops to revisit satisfied folds indefinitely without tightening bounds.
+\item \textbf{Low-Precision Key Collision:} Serializing radii with six significant digits merges distinct nearby float64 radii into a single output key.
+\item \textbf{Zero-Radius Quota Substitution:} Substituting the shared repeat quota for the larger fold-specific candidate count inside the zero-radius statistics branch breaks audit counts.
+\end{itemize}
+Targeted regression and mutation tests (87 synthetic cases, including large-coordinate scale-margin checks) confirm that disabling either the boundary tolerance $\tau$ or proven-fold exclusion immediately triggers boundary failures or loop-progress guards.
+
+\textbf{Practical Engineering Implications.} Taken together, our findings yield three actionable guidelines for geospatial ML data pipelines: (1) \emph{Prefer shared vectorization at city scale.} In single-node Python/SciPy pipelines on tables of $10^3$--$10^4$ points, batch KD-tree evaluation with distance reuse (B1) outperforms complex incremental pruning both in speed and implementation simplicity. (2) \emph{Prioritize I/O over geometric micro-optimization.} Because gzip CSV serialization consumes a median 42.2\% (and up to 80.2\%) of end-to-end runtime, replacing text compression with columnar binary formats (e.g., Apache Arrow or Parquet) or faster codecs (e.g., Zstd) offers far greater real-world speedup than cutting candidate queries by $\sim$10\%. (3) \emph{Enforce explicit contract invariants.} Any implementation that caches truncated distances or reuses quotas must track per-entry validity domains and full float64 serialization keys to guard against silent data-split corruption.
+
+\section{Conclusion}
+We introduced \sys, a formalized contract and end-to-end diagnostic benchmark for exact spatially buffered split construction with cross-fold shared class quotas. Across 12 real-world workloads spanning 10 cities, the output-aware incremental pipeline (\full) consistently runs 1.28--2.09$\times$ slower than the faster shared KD-tree baseline in cold single-radius execution despite reducing candidate-point queries by 9.41\%, and neither warm caches nor externally supplied quotas reverse this outcome. Controlled deletion sweeps and phase profiling confirm that quota closure, rank traversal, block-center queries, and gzip serialization (median 42.2\% of elapsed time) offset point-level geometric savings. Consequently, counting geometric queries alone is an unreliable proxy for coupled spatial data-preparation operators; credible evaluation must measure filtering, aggregation, ordering, and output serialization together under a verifiable contract.
+
+\textbf{Limitations and Future Work.} Our empirical results characterize single-threaded Python implementations on static city-scale snapshots ($10^3$--$10^4$ rows), and our PostGIS evaluation verifies SQL semantic equivalence on one city rather than cross-engine throughput. Three directions follow naturally from these findings: (1) compiling the incremental quota-closure and windowed-scan operators in native C++ or Rust and scaling to $10^6$+ point tables to identify whether a crossover point emerges where output-aware pruning overtakes batch vectorization; (2) replacing gzip CSV output with zero-copy columnar formats and asynchronous compression to eliminate the dominant serialization bottleneck; and (3) benchmarking end-to-end throughput against native spatial database executors and multi-threaded index engines.
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+\end{document}
+
